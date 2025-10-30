@@ -1,0 +1,25 @@
+{
+	"name": "node-api-template",
+	"version": "1.0.0",
+	"description": "API Rest de Node.js con Express basada en archivos y rutas automáticas",
+	"main": "src/main.js",
+	"type": "module",
+	"scripts": {
+		"dev": "node --watch-path=src src/main.js",
+		"start": "node src/main.js"
+	},
+	"keywords": [],
+	"author": "Guillermo Merino",
+	"license": "ISC",
+	"packageManager": "pnpm@10.20.0",
+	"dependencies": {
+		"cors": "2.8.5",
+		"express": "5.1.0"
+	},
+	"devDependencies": {
+		"@eslint/js": "9.38.0",
+		"@eslint/json": "0.13.2",
+		"eslint": "9.38.0",
+		"globals": "16.4.0"
+	}
+}

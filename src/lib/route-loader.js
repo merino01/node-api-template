@@ -1,13 +1,15 @@
 import { access, constants, readdir, stat } from "node:fs/promises"
-import { join, resolve, dirname, relative } from "node:path"
+import { join, dirname, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Router } from "express"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROUTER_DIR = join(__dirname, "..", "routes")
+const MODULES_DIR = join(__dirname, "..", "modules")
 
 const ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
 const PARAM_SEGMENT_RE = /^\[(\.\.\.)?([^\]]+)\]$/
+const MODULE_PROXY_RE = /^\[module\]$/
 const FILE_METHOD_RE = /\.(get|post|put|delete|patch|options|head)$/i
 
 function parseRouteFromFileName (nameWithoutExt, basePath) {
@@ -67,11 +69,13 @@ function cleanRoutePath (routePath) {
 	return routePath.replace(/\/+/g, "/").replace(/\/$/, "") || "/"
 }
 
-function logRoute (method, routePath, filePath) {
-	console.log(`📁 Loaded route: ${method.padEnd(6)} ${routePath} -> ${relative(join(__dirname, ".."), filePath)}`)
+function logRoute (method, routePath, filePath, modulePrefix = "") {
+	const prefix = modulePrefix ? `[${modulePrefix}] ` : ""
+	const relativePath = relative(join(__dirname, ".."), filePath)
+	console.log(`📁 ${prefix}Loaded route: ${method.padEnd(6)} ${routePath} -> ${relativePath}`)
 }
 
-function registerSingleRoute ({ router, method, routePath, handler, filePath, middlewares }) {
+function registerSingleRoute ({ router, method, routePath, handler, filePath, middlewares, modulePrefix }) {
 	const cleanPath = cleanRoutePath(routePath)
 
 	try {
@@ -85,7 +89,7 @@ function registerSingleRoute ({ router, method, routePath, handler, filePath, mi
 		} else {
 			router[method.toLowerCase()](cleanPath, handler)
 		}
-		logRoute(method, cleanPath, filePath)
+		logRoute(method, cleanPath, filePath, modulePrefix)
 	} catch (error) {
 		console.error(`❌ Error registering ${method} ${cleanPath}:`, error.message)
 	}
@@ -105,18 +109,26 @@ function extractMiddlewares (module) {
 	return middlewares
 }
 
-function registerSpecificMethods ({ router, module, routePath, httpMethods, fullPath }) {
+function registerSpecificMethods ({ router, module, routePath, httpMethods, fullPath, modulePrefix }) {
 	const middlewares = extractMiddlewares(module)
 
 	for (const method of httpMethods) {
 		const handler = module.default || module[method]
 		if (handler) {
-			registerSingleRoute({ router, method, routePath, handler, filePath: fullPath, middlewares })
+			registerSingleRoute({
+				router,
+				method,
+				routePath,
+				handler,
+				filePath: fullPath,
+				middlewares,
+				modulePrefix
+			})
 		}
 	}
 }
 
-function registerAllMethods ({ router, module, routePath, fullPath }) {
+function registerAllMethods ({ router, module, routePath, fullPath, modulePrefix }) {
 	const middlewares = extractMiddlewares(module)
 
 	for (const method of ALLOWED_METHODS) {
@@ -127,7 +139,8 @@ function registerAllMethods ({ router, module, routePath, fullPath }) {
 				routePath,
 				handler: module[method],
 				filePath: fullPath,
-				middlewares
+				middlewares,
+				modulePrefix
 			})
 		}
 	}
@@ -140,30 +153,150 @@ function registerAllMethods ({ router, module, routePath, fullPath }) {
 			routePath,
 			handler: module.default,
 			filePath: fullPath,
-			middlewares
+			middlewares,
+			modulePrefix
 		})
 	}
 }
 
-async function processRouteFile ({ fullPath, basePath, fileName, router }) {
+async function moduleExists (moduleName) {
+	try {
+		const modulePath = join(MODULES_DIR, moduleName)
+		await access(modulePath, constants.F_OK)
+		const moduleStat = await stat(modulePath)
+		return moduleStat.isDirectory()
+	} catch {
+		return false
+	}
+}
+
+async function getAvailableModules () {
+	try {
+		const modules = await readdir(MODULES_DIR)
+		const availableModules = []
+
+		for (const moduleName of modules) {
+			if (await moduleExists(moduleName)) {
+				availableModules.push(moduleName)
+			}
+		}
+
+		return availableModules
+	} catch {
+		return []
+	}
+}
+
+async function createModuleProxy (proxyHandler, basePath) {
+	return async (req, res, next) => {
+		const urlParts = req.path.replace(basePath, "").split("/").filter(Boolean)
+		const moduleName = urlParts[0]
+
+		if (!moduleName) {
+			return res.status(400).json({
+				success: false,
+				message: "Module name is required"
+			})
+		}
+
+		const moduleExistsFlag = await moduleExists(moduleName)
+		if (!moduleExistsFlag) {
+			return res.status(404).json({
+				success: false,
+				message: `Module '${moduleName}' not found`,
+				availableModules: await getAvailableModules()
+			})
+		}
+
+		const context = {
+			req,
+			res,
+			params: {
+				module: moduleName,
+				...req.params
+			},
+			query: req.query,
+			body: req.body,
+			moduleName,
+			remainingPath: "/" + urlParts.slice(1).join("/"),
+			basePath,
+			method: req.method
+		}
+
+		try {
+			const result = await proxyHandler(context)
+
+			if (!res.headersSent && result !== undefined) {
+				res.json(result)
+			}
+		} catch (error) {
+			if (!res.headersSent) {
+				const status = error.status || 500
+				res.status(status).json({
+					success: false,
+					message: error.message,
+					...(error.details && { details: error.details })
+				})
+			}
+		}
+	}
+}
+
+async function processRouteFile ({ fullPath, basePath, fileName, router, modulePrefix }) {
 	const nameWithoutExt = fileName.replace(".js", "")
 	const routePath = parseRouteFromFileName(nameWithoutExt, basePath)
 	const httpMethods = parseHttpMethods(nameWithoutExt)
 
+	const isModuleProxy = MODULE_PROXY_RE.test(nameWithoutExt)
+
 	try {
 		const module = await import(`file://${fullPath}`)
 
-		if (httpMethods.length > 0) {
-			registerSpecificMethods({ router, module, routePath, httpMethods, fullPath })
+		if (isModuleProxy) {
+			const proxyHandler = module.default || module.handler
+			if (!proxyHandler) {
+				console.error(`❌ Module proxy ${fullPath} must export a default function or handler`)
+				return
+			}
+
+			const proxyMiddleware = await createModuleProxy(proxyHandler, routePath)
+			const proxyPath = `${routePath}/:module/*`
+
+			if (httpMethods.length > 0) {
+				for (const method of httpMethods) {
+					router[method.toLowerCase()](proxyPath, proxyMiddleware)
+					logRoute(method, proxyPath, fullPath, `${modulePrefix || "global"}-proxy`)
+				}
+			} else {
+				router.use(proxyPath, proxyMiddleware)
+				logRoute("ALL", proxyPath, fullPath, `${modulePrefix || "global"}-proxy`)
+			}
 		} else {
-			registerAllMethods({ router, module, routePath, fullPath })
+			if (httpMethods.length > 0) {
+				registerSpecificMethods({
+					router,
+					module,
+					routePath,
+					httpMethods,
+					fullPath,
+					modulePrefix
+				})
+			} else {
+				registerAllMethods({
+					router,
+					module,
+					routePath,
+					fullPath,
+					modulePrefix
+				})
+			}
 		}
 	} catch (error) {
 		console.error(`❌ Error loading route ${fullPath}:`, error.message)
 	}
 }
 
-async function scanDirectory ({ dir, basePath = "", router }) {
+async function scanDirectory ({ dir, basePath = "", router, modulePrefix }) {
 	const items = await readdir(dir)
 
 	for (const item of items) {
@@ -174,31 +307,87 @@ async function scanDirectory ({ dir, basePath = "", router }) {
 			await scanDirectory({
 				dir: fullPath,
 				basePath: `${basePath}/${item}`,
-				router
+				router,
+				modulePrefix
 			})
 		} else if (item.endsWith(".js")) {
 			await processRouteFile({
 				fullPath,
 				basePath,
 				fileName: item,
-				router
+				router,
+				modulePrefix
 			})
 		}
 	}
 }
 
-export async function createApiRouter () {
-	const router = Router()
-	const apiDir = resolve(__dirname, ROUTER_DIR)
-
+async function scanModuleRoutes (router) {
 	try {
-		await access(apiDir, constants.F_OK)
+		await access(MODULES_DIR, constants.F_OK)
+		console.log(`🔍 Scanning modules directory: ${relative(join(__dirname, ".."), MODULES_DIR)}`)
+
+		const modules = await readdir(MODULES_DIR)
+		let moduleCount = 0
+
+		for (const moduleName of modules) {
+			const modulePath = join(MODULES_DIR, moduleName)
+			const moduleStat = await stat(modulePath)
+
+			if (!moduleStat.isDirectory()) {continue}
+
+			const routesPath = join(modulePath, "routes")
+
+			try {
+				await access(routesPath, constants.F_OK)
+				console.log(`📦 Loading routes for module: ${moduleName}`)
+
+				// Las rutas del módulo se montan con el prefijo del nombre del módulo
+				const moduleBasePath = `/api/${moduleName}`
+
+				await scanDirectory({
+					dir: routesPath,
+					basePath: moduleBasePath,
+					router,
+					modulePrefix: moduleName
+				})
+
+				moduleCount++
+			} catch {
+				console.log(`⚠️  Module '${moduleName}' has no routes directory, skipping`)
+			}
+		}
+
+		if (moduleCount > 0) {
+			console.log(`✅ Successfully loaded routes from ${moduleCount} module(s)`)
+		} else {
+			console.log("⚠️  No modules with routes found")
+		}
 	} catch {
-		console.warn(`📁 API directory not found: ${apiDir}`)
-		return router
+		console.log(`⚠️  Modules directory not found: ${relative(join(__dirname, ".."), MODULES_DIR)}`)
 	}
+}
 
-	await scanDirectory({ dir: apiDir, router })
+async function scanGlobalRoutes (router) {
+	try {
+		await access(ROUTER_DIR, constants.F_OK)
+		console.log(`🔍 Scanning global routes directory: ${relative(join(__dirname, ".."), ROUTER_DIR)}`)
 
+		await scanDirectory({ dir: ROUTER_DIR, router, modulePrefix: "global" })
+
+		console.log("✅ Global routes loaded")
+	} catch {
+		console.log(`⚠️  Global routes directory not found: ${relative(join(__dirname, ".."), ROUTER_DIR)}`)
+	}
+}
+
+export async function createApiRouter () {
+	console.log("🚀 Starting route loader...")
+	const router = Router()
+
+	await scanGlobalRoutes(router)
+	await scanModuleRoutes(router)
+
+	console.log("🎉 Route loading completed!")
 	return router
 }
